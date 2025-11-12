@@ -151,6 +151,52 @@ const createTransaction = createAsyncThunk(
   }
 );
 
+// Async thunk to mark transaction as returned
+const markAsReturned = createAsyncThunk(
+  'borrowing/markAsReturned',
+  async (transactionId) => {
+    const response = await fetch(`${API_BASE_URL}/api/transactions/${transactionId}/`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        date_returned: new Date().toISOString().split('T')[0],
+      }),
+    });
+    
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Failed to mark as returned');
+    }
+    
+    const transaction = await response.json();
+    
+    // Fetch full borrower and item details
+    try {
+      const [borrowerResponse, itemResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/customers/${transaction.borrower}/`),
+        fetch(`${API_BASE_URL}/api/items/${transaction.item}/`)
+      ]);
+      
+      const borrower = borrowerResponse.ok ? await borrowerResponse.json() : null;
+      const item = itemResponse.ok ? await itemResponse.json() : null;
+      
+      return {
+        ...transaction,
+        borrower: borrower || { first_name: transaction.borrower_name || 'Unknown' },
+        item: item || { name: transaction.item_name || 'Unknown' },
+      };
+    } catch (error) {
+      return {
+        ...transaction,
+        borrower: { first_name: transaction.borrower_name || 'Unknown' },
+        item: { name: transaction.item_name || 'Unknown' },
+      };
+    }
+  }
+);
+
 // Redux slice
 const borrowingSlice = createSlice({
   name: 'borrowing',
@@ -210,6 +256,30 @@ const borrowingSlice = createSlice({
       .addCase(createTransaction.rejected, (state, action) => {
         state.loading = false;
         state.error = action.error.message;
+      })
+      // Mark as returned
+      .addCase(markAsReturned.pending, (state) => {
+        state.loading = true;
+        state.error = null;
+      })
+      .addCase(markAsReturned.fulfilled, (state, action) => {
+        state.loading = false;
+        const index = state.items.findIndex(item => item.id === action.payload.id);
+        if (index !== -1) {
+          const [year, month, day] = action.payload.due_date.split('-');
+          const formattedDate = `${month}/${day}/${year}`;
+          state.items[index] = {
+            ...action.payload,
+            dueDate: formattedDate,
+            status: 'returned',
+          };
+        }
+        // Remove returned items from count
+        state.count = state.items.filter(item => item.status !== 'returned').length;
+      })
+      .addCase(markAsReturned.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.error.message;
       });
   },
 });
@@ -224,17 +294,25 @@ const store = configureStore({
 });
 
 // Item Detail Modal Component
-function ItemDetailModal({ visible, item, onClose }) {
+function ItemDetailModal({ visible, item, onClose, onMarkReturned }) {
   if (!item) return null;
   
   const borrower = item.borrower || {};
   const itemData = item.item || {};
+  const isReturned = item.status === 'returned';
   
   const formatDate = (dateString) => {
     if (!dateString) return 'N/A';
     if (dateString.includes('/')) return dateString; // Already formatted
     const [year, month, day] = dateString.split('-');
     return `${month}/${day}/${year}`;
+  };
+  
+  const handleMarkReturned = async () => {
+    if (onMarkReturned) {
+      await onMarkReturned(item.id);
+      onClose();
+    }
   };
   
   return (
@@ -248,6 +326,12 @@ function ItemDetailModal({ visible, item, onClose }) {
         <View style={styles.modalContent}>
           <ScrollView showsVerticalScrollIndicator={true}>
             <Text style={styles.modalTitle}>Item Details</Text>
+            
+            {isReturned && (
+              <View style={styles.returnedBadge}>
+                <Text style={styles.returnedBadgeText}>✓ RETURNED</Text>
+              </View>
+            )}
             
             <View style={styles.modalSection}>
               <Text style={styles.modalSectionTitle}>Borrower Information</Text>
@@ -270,7 +354,16 @@ function ItemDetailModal({ visible, item, onClose }) {
               <Text style={styles.modalSectionTitle}>Dates</Text>
               <Text style={styles.modalText}><Text style={styles.modalLabel}>Date Issued:</Text> {formatDate(item.date_issued)}</Text>
               <Text style={styles.modalText}><Text style={styles.modalLabel}>Due Date:</Text> {formatDate(item.dueDate || item.due_date)}</Text>
+              {item.date_returned && (
+                <Text style={styles.modalText}><Text style={styles.modalLabel}>Date Returned:</Text> {formatDate(item.date_returned)}</Text>
+              )}
             </View>
+            
+            {!isReturned && (
+              <TouchableOpacity style={styles.returnButton} onPress={handleMarkReturned}>
+                <Text style={styles.returnButtonText}>Mark as Returned</Text>
+              </TouchableOpacity>
+            )}
             
             <TouchableOpacity style={styles.modalCloseButton} onPress={onClose}>
               <Text style={styles.modalCloseButtonText}>Close</Text>
@@ -294,13 +387,16 @@ function Dashboard({ onNavigateToAddItem }) {
     dispatch(fetchTransactions());
   }, [dispatch]);
   
+  // Filter out returned items
+  const activeItems = items.filter(item => item.status !== 'returned');
+  
   // Calculate stats
   const today = new Date();
-  const overdueItems = items.filter(item => {
+  const overdueItems = activeItems.filter(item => {
     const dueDate = item.due_date ? new Date(item.due_date) : new Date(item.dueDate);
     return dueDate < today;
   });
-  const dueSoonItems = items.filter(item => {
+  const dueSoonItems = activeItems.filter(item => {
     const dueDate = item.due_date ? new Date(item.due_date) : new Date(item.dueDate);
     const diffDays = Math.ceil((dueDate - today) / (1000 * 60 * 60 * 24));
     return diffDays >= 0 && diffDays <= 3;
@@ -315,13 +411,23 @@ function Dashboard({ onNavigateToAddItem }) {
     setModalVisible(false);
     setSelectedItem(null);
   };
+  
+  const handleMarkReturned = async (transactionId) => {
+    try {
+      await dispatch(markAsReturned(transactionId)).unwrap();
+      Alert.alert('Success', 'Item marked as returned');
+    } catch (err) {
+      Alert.alert('Error', err.message || 'Failed to mark as returned');
+    }
+  };
 
   return (
     <View style={{ flex: 1 }}>
       <ItemDetailModal 
         visible={modalVisible} 
         item={selectedItem} 
-        onClose={handleCloseModal} 
+        onClose={handleCloseModal}
+        onMarkReturned={handleMarkReturned}
       />
       <ScrollView style={styles.container}>
         <Text style={styles.title}>📊 Dashboard</Text>
@@ -342,7 +448,7 @@ function Dashboard({ onNavigateToAddItem }) {
       {/* Stats Cards */}
       <View style={styles.statsContainer}>
         <View style={[styles.statCard, styles.statCardBlue]}>
-          <Text style={styles.statNumber}>{count}</Text>
+          <Text style={styles.statNumber}>{activeItems.length}</Text>
           <Text style={styles.statLabel}>Total Items</Text>
         </View>
         
@@ -402,10 +508,10 @@ function Dashboard({ onNavigateToAddItem }) {
       )}
 
       {/* Recent Items */}
-      {items.length > 0 && (
+      {activeItems.length > 0 && (
         <View style={styles.recentSection}>
           <Text style={styles.recentTitle}>📝 Recent Items</Text>
-          {items.slice(-5).reverse().map((item) => {
+          {activeItems.slice(-5).reverse().map((item) => {
             const dueDate = item.due_date ? new Date(item.due_date) : new Date(item.dueDate);
             const isOverdue = dueDate < today;
             return (
@@ -432,7 +538,7 @@ function Dashboard({ onNavigateToAddItem }) {
       )}
 
       {/* Empty State */}
-      {items.length === 0 && (
+      {activeItems.length === 0 && (
         <View style={styles.emptyState}>
           <Text style={styles.emptyStateText}>No items yet. Add your first item to get started!</Text>
         </View>
@@ -629,7 +735,7 @@ function AddItemPage({ onNavigateBack }) {
       </View>
       
       <View style={styles.listContainer}>
-        {items.map((item) => {
+        {items.filter(item => item.status !== 'returned').map((item) => {
           const dueDate = item.due_date ? new Date(item.due_date) : new Date(item.dueDate);
           const isOverdue = dueDate < new Date();
           return (
@@ -1087,5 +1193,30 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.5,
+  },
+  returnButton: {
+    backgroundColor: '#2196F3',
+    padding: 15,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 10,
+    marginBottom: 10,
+  },
+  returnButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  returnedBadge: {
+    backgroundColor: '#4CAF50',
+    padding: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 15,
+  },
+  returnedBadgeText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
 });
